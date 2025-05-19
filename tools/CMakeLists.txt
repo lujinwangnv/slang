@@ -48,14 +48,18 @@ endfunction()
 if(NOT SLANG_OVERRIDE_LUA_PATH)
     generator(
         slang-fiddle
-        LINK_WITH_PRIVATE compiler-core
-        INCLUDE_DIRECTORIES_PUBLIC ${slang_SOURCE_DIR}/external/lua
+        LINK_WITH_PRIVATE
+        compiler-core
+        INCLUDE_DIRECTORIES_PUBLIC
+        ${slang_SOURCE_DIR}/external/lua
     )
 else()
     generator(
         slang-fiddle
-        LINK_WITH_PRIVATE compiler-core
-        INCLUDE_DIRECTORIES_PUBLIC ${SLANG_OVERRIDE_LUA_PATH}
+        LINK_WITH_PRIVATE
+        compiler-core
+        INCLUDE_DIRECTORIES_PUBLIC
+        ${SLANG_OVERRIDE_LUA_PATH}
     )
 endif()
 generator(slang-embed)
