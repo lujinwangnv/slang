@@ -2165,8 +2165,7 @@ LinkedIR linkIR(CodeGenContext* codeGenContext)
     {
         for (auto inst : irModule->getGlobalInsts())
         {
-            if (as<IRBindGlobalGenericParam>(inst) ||
-                as<IRDebugSource>(inst))
+            if (as<IRBindGlobalGenericParam>(inst) || as<IRDebugSource>(inst))
             {
                 cloneValue(context, inst);
             }
