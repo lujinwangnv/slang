@@ -4104,6 +4104,1380 @@ struct ExprLoweringContext
     }
 };
 
+struct StmtLoweringVisitor : StmtVisitor<StmtLoweringVisitor>
+{
+    IRGenContext* context;
+
+    IRBuilder* getBuilder() { return context->irBuilder; }
+
+    void visitEmptyStmt(EmptyStmt*)
+    {
+        // Nothing to do.
+    }
+
+    void visitUnparsedStmt(UnparsedStmt*) { SLANG_UNEXPECTED("UnparsedStmt not supported by IR"); }
+
+    void visitCaseStmtBase(CaseStmtBase*)
+    {
+        SLANG_UNEXPECTED("`case` or `default` not under `switch`");
+    }
+
+    void visitLabelStmt(LabelStmt* stmt) { lowerStmt(context, stmt->innerStmt); }
+
+    void visitCompileTimeForStmt(CompileTimeForStmt* stmt)
+    {
+        // The user is asking us to emit code for the loop
+        // body for each value in the given integer range.
+        // For now, we will handle this by repeatedly lowering
+        // the body statement, with the loop variable bound
+        // to a different integer literal value each time.
+        //
+        // TODO: eventually we might handle this as just an
+        // ordinary loop, with an `[unroll]` attribute on
+        // it that we would respect.
+
+        auto rangeBeginVal = getIntVal(stmt->rangeBeginVal);
+        auto rangeEndVal = getIntVal(stmt->rangeEndVal);
+
+        if (rangeBeginVal >= rangeEndVal)
+            return;
+
+        auto varDecl = stmt->varDecl;
+        auto varType = lowerType(context, varDecl->type);
+
+        IRGenEnv subEnvStorage;
+        IRGenEnv* subEnv = &subEnvStorage;
+        subEnv->outer = context->env;
+
+        IRGenContext subContextStorage = *context;
+        IRGenContext* subContext = &subContextStorage;
+        subContext->env = subEnv;
+
+
+        for (IntegerLiteralValue ii = rangeBeginVal; ii < rangeEndVal; ++ii)
+        {
+            auto constVal = getBuilder()->getIntValue(varType, ii);
+
+            subEnv->mapDeclToValue[varDecl] = LoweredValInfo::simple(constVal);
+
+            lowerStmt(subContext, stmt->body);
+        }
+    }
+
+    // Create a basic block in the current function,
+    // so that it can be used for a label.
+    IRBlock* createBlock() { return getBuilder()->createBlock(); }
+
+    /// Does the given block have a terminator?
+    bool isBlockTerminated(IRBlock* block) { return block->getTerminator() != nullptr; }
+
+    /// Emit a branch to the target block if the current
+    /// block being inserted into is not already terminated.
+    void emitBranchIfNeeded(IRBlock* targetBlock)
+    {
+        auto builder = getBuilder();
+        auto currentBlock = builder->getBlock();
+
+        // Don't emit if there is no current block.
+        if (!currentBlock)
+            return;
+
+        // Don't emit if the block already has a terminator.
+        if (isBlockTerminated(currentBlock))
+            return;
+
+        // The block is unterminated, so cap it off with
+        // a terminator that branches to the target.
+        builder->emitBranch(targetBlock);
+    }
+
+    /// Insert a block at the current location (ending
+    /// the previous block with an unconditional jump
+    /// if needed).
+    void insertBlock(IRBlock* block)
+    {
+        auto builder = getBuilder();
+
+        auto prevBlock = builder->getBlock();
+        auto parentFunc = prevBlock ? prevBlock->getParent() : builder->getFunc();
+
+        // If the previous block doesn't already have
+        // a terminator instruction, then be sure to
+        // emit a branch to the new block.
+        emitBranchIfNeeded(block);
+
+        // Add the new block to the function we are building,
+        // and setit as the block we will be inserting into.
+        parentFunc->addBlock(block);
+        builder->setInsertInto(block);
+    }
+
+    // Start a new block at the current location.
+    // This is just the composition of `createBlock`
+    // and `insertBlock`.
+    IRBlock* startBlock()
+    {
+        auto block = createBlock();
+        insertBlock(block);
+        return block;
+    }
+
+    /// Start a new block if there isn't a current
+    /// block that we can append to.
+    ///
+    /// The `stmt` parameter is the statement we
+    /// are about to emit.
+    void startBlockIfNeeded(Stmt* stmt)
+    {
+        auto builder = getBuilder();
+        auto currentBlock = builder->getBlock();
+
+        // If there is a current block and it hasn't
+        // been terminated, then we can just use that.
+        if (currentBlock && !isBlockTerminated(currentBlock))
+        {
+            return;
+        }
+
+        // We are about to emit code *after* a terminator
+        // instruction, and there is no label to allow
+        // branching into this code, so whatever we are
+        // about to emit is going to be unreachable.
+        //
+        // Let's diagnose that here just to help the user.
+        //
+        // TODO: We might want to have a more robust check
+        // for unreachable code based on IR analysis instead,
+        // at which point we'd probably disable this check.
+        //
+        context->getSink()->diagnose(stmt, Diagnostics::unreachableCode);
+
+        startBlock();
+    }
+
+    /// Create a new scope end block and return the previous one.
+    ///
+    /// This is needed for `defer` to be aware of scopes. `preallocated` can
+    /// be specified if you already have a block at the end of the scope, like
+    /// in `for` loops.
+    IRBlock* pushScopeBlock(IRBlock* preallocated = nullptr)
+    {
+        IRBlock* prevScopeEndBlock = context->scopeEndBlock;
+
+        auto builder = getBuilder();
+        context->scopeEndBlock = preallocated ? preallocated : builder->createBlock();
+        return prevScopeEndBlock;
+    }
+
+    /// Pop the current scope end block and restore the previous one.
+    ///
+    /// This is needed for `defer` to be aware of scopes. `previous` should be
+    /// the block returned from the corresponding pushScopeBlock. `preallocated`
+    /// should be true if the corresponding pushScopeBlock was given a block
+    /// as a parameter.
+    void popScopeBlock(IRBlock* previous, bool preallocated)
+    {
+        if (!preallocated)
+        {
+            // If pushScopeBlock actually created the block, we have to insert
+            // or deallocate it here. Otherwise, we assume that the caller
+            // handles the end block.
+            auto builder = getBuilder();
+            if (context->scopeEndBlock->hasUses())
+            {
+                // The end of the scope was referenced, so we need to actually
+                // keep it around and jump through it.
+                // Move the terminator to the scope end block.
+                emitBranchIfNeeded(context->scopeEndBlock);
+                builder->insertBlock(context->scopeEndBlock);
+                builder->setInsertInto(context->scopeEndBlock);
+            }
+            else
+            {
+                // Scope end block was left unused, so we may as well delete it.
+                context->scopeEndBlock->removeAndDeallocate();
+            }
+        }
+
+        context->scopeEndBlock = previous;
+    }
+
+    void visitIfStmt(IfStmt* stmt)
+    {
+        auto builder = getBuilder();
+        startBlockIfNeeded(stmt);
+
+        auto condExpr = stmt->predicate;
+        auto thenStmt = stmt->positiveStatement;
+        auto elseStmt = stmt->negativeStatement;
+
+        auto irCond = getSimpleVal(context, lowerRValueExpr(context, condExpr));
+
+        maybeEmitDebugLine(context, *this, stmt, condExpr->loc);
+
+        IRInst* ifInst = nullptr;
+
+        if (elseStmt)
+        {
+            auto thenBlock = createBlock();
+            auto elseBlock = createBlock();
+            auto afterBlock = createBlock();
+
+            ifInst = builder->emitIfElse(irCond, thenBlock, elseBlock, afterBlock);
+
+            insertBlock(thenBlock);
+            IRBlock* prevScopeEndBlock = pushScopeBlock(afterBlock);
+            lowerStmt(context, thenStmt);
+            emitBranchIfNeeded(afterBlock);
+
+            insertBlock(elseBlock);
+            lowerStmt(context, elseStmt);
+            popScopeBlock(prevScopeEndBlock, true);
+
+            insertBlock(afterBlock);
+        }
+        else
+        {
+            auto thenBlock = createBlock();
+            auto afterBlock = createBlock();
+
+            ifInst = builder->emitIf(irCond, thenBlock, afterBlock);
+
+            insertBlock(thenBlock);
+
+            IRBlock* prevScopeEndBlock = pushScopeBlock(afterBlock);
+            lowerStmt(context, thenStmt);
+            popScopeBlock(prevScopeEndBlock, true);
+
+            insertBlock(afterBlock);
+        }
+
+        if (stmt->findModifier<FlattenAttribute>())
+        {
+            builder->addDecoration(ifInst, kIROp_FlattenDecoration);
+        }
+        if (stmt->findModifier<BranchAttribute>())
+        {
+            builder->addDecoration(ifInst, kIROp_BranchDecoration);
+        }
+    }
+
+    void addLoopDecorations(IRInst* inst, Stmt* stmt)
+    {
+        if (stmt->findModifier<UnrollAttribute>())
+        {
+            getBuilder()->addLoopControlDecoration(inst, kIRLoopControl_Unroll);
+        }
+        else if (stmt->findModifier<LoopAttribute>())
+        {
+            getBuilder()->addLoopControlDecoration(inst, kIRLoopControl_Loop);
+        }
+
+        if (auto maxItersAttr = stmt->findModifier<MaxItersAttribute>())
+        {
+            auto iters = lowerVal(context, maxItersAttr->value);
+            getBuilder()->addLoopMaxItersDecoration(inst, getSimpleVal(context, iters));
+        }
+        else if (auto inferredMaxItersAttr = stmt->findModifier<InferredMaxItersAttribute>())
+        {
+            getBuilder()->addLoopMaxItersDecoration(inst, inferredMaxItersAttr->value);
+        }
+
+        if (auto forceUnrollAttr = stmt->findModifier<ForceUnrollAttribute>())
+        {
+            getBuilder()->addLoopForceUnrollDecoration(inst, forceUnrollAttr->maxIterations);
+        }
+        // TODO: handle other cases here
+    }
+
+    void visitForStmt(ForStmt* stmt)
+    {
+        auto builder = getBuilder();
+        startBlockIfNeeded(stmt);
+
+        // The initializer clause for the statement
+        // can always safetly be emitted to the current block.
+        if (auto initStmt = stmt->initialStatement)
+        {
+            lowerStmt(context, initStmt);
+        }
+
+        // We will create blocks for the various places
+        // we need to jump to inside the control flow,
+        // including the blocks that will be referenced
+        // by `continue` or `break` statements.
+        auto loopHead = createBlock();
+        auto bodyLabel = createBlock();
+        auto breakLabel = createBlock();
+        auto continueLabel = createBlock();
+
+        // Register the `break` and `continue` labels so
+        // that we can find them for nested statements.
+        context->shared->breakLabels.add(stmt->uniqueID, breakLabel);
+        context->shared->continueLabels.add(stmt->uniqueID, continueLabel);
+
+        // Emit the branch that will start out loop,
+        // and then insert the block for the head.
+
+        auto loopInst = builder->emitLoop(loopHead, breakLabel, continueLabel);
+
+        insertBlock(loopHead);
+
+        // Now that we are within the header block, we
+        // want to emit the expression for the loop condition:
+        if (const auto condExpr = stmt->predicateExpression)
+        {
+            maybeEmitDebugLine(context, *this, stmt, condExpr->loc);
+
+            auto irCondition =
+                getSimpleVal(context, lowerRValueExpr(context, stmt->predicateExpression));
+
+            // Now we want to `break` if the loop condition is false.
+            builder->emitLoopTest(irCondition, bodyLabel, breakLabel);
+        }
+
+        // Emit the body of the loop
+        insertBlock(bodyLabel);
+        IRBlock* prevScopeEndBlock = pushScopeBlock(continueLabel);
+        lowerStmt(context, stmt->statement);
+        popScopeBlock(prevScopeEndBlock, true);
+
+        if (auto inferredMaxIters = stmt->findModifier<InferredMaxItersAttribute>())
+        {
+            // We only use inferred max iters attribute when the loop body
+            // does not modify induction var.
+            auto inductionVar =
+                emitDeclRef(context, inferredMaxIters->inductionVar, builder->getIntType());
+            if (inductionVar.val)
+            {
+                int writes = 0;
+                traverseUsers(
+                    inductionVar.val,
+                    [&](IRInst* user)
+                    {
+                        if (user->getOp() != kIROp_Load)
+                            writes++;
+                    });
+                if (writes > 1)
+                {
+                    removeModifier(stmt, inferredMaxIters);
+                }
+            }
+        }
+        if (auto inferredMaxIters = stmt->findModifier<InferredMaxItersAttribute>())
+        {
+            if (auto maxIters = stmt->findModifier<MaxItersAttribute>())
+            {
+                if (auto constIntVal = as<ConstantIntVal>(maxIters->value))
+                {
+                    if (inferredMaxIters->value < constIntVal->getValue())
+                    {
+                        context->getSink()->diagnose(
+                            maxIters,
+                            Diagnostics::forLoopTerminatesInFewerIterationsThanMaxIters,
+                            inferredMaxIters->value);
+                    }
+                }
+            }
+        }
+        addLoopDecorations(loopInst, stmt);
+
+
+        // Insert the `continue` block
+        insertBlock(continueLabel);
+        if (auto incrExpr = stmt->sideEffectExpression)
+        {
+            maybeEmitDebugLine(context, *this, stmt, incrExpr->loc);
+            lowerRValueExpr(context, incrExpr);
+        }
+
+        // At the end of the body we need to jump back to the top.
+        emitBranchIfNeeded(loopHead);
+
+        // Finally we insert the label that a `break` will jump to
+        insertBlock(breakLabel);
+    }
+
+    void visitWhileStmt(WhileStmt* stmt)
+    {
+        // Generating IR for `while` statement is similar to a
+        // `for` statement, but without a lot of the complications.
+
+        auto builder = getBuilder();
+        startBlockIfNeeded(stmt);
+
+        // We will create blocks for the various places
+        // we need to jump to inside the control flow,
+        // including the blocks that will be referenced
+        // by `continue` or `break` statements.
+        auto loopHead = createBlock();
+        auto bodyLabel = createBlock();
+        auto breakLabel = createBlock();
+
+        // A `continue` inside a `while` loop always
+        // jumps to the head of hte loop.
+        auto continueLabel = loopHead;
+
+        // Register the `break` and `continue` labels so
+        // that we can find them for nested statements.
+        context->shared->breakLabels.add(stmt->uniqueID, breakLabel);
+        context->shared->continueLabels.add(stmt->uniqueID, continueLabel);
+
+        // Emit the branch that will start out loop,
+        // and then insert the block for the head.
+
+        auto loopInst = builder->emitLoop(loopHead, breakLabel, continueLabel);
+
+        addLoopDecorations(loopInst, stmt);
+
+        insertBlock(loopHead);
+
+        // Now that we are within the header block, we
+        // want to emit the expression for the loop condition:
+        if (auto condExpr = stmt->predicate)
+        {
+            maybeEmitDebugLine(context, *this, stmt, condExpr->loc);
+
+            auto irCondition = getSimpleVal(context, lowerRValueExpr(context, condExpr));
+
+            // Now we want to `break` if the loop condition is false.
+            builder->emitLoopTest(irCondition, bodyLabel, breakLabel);
+        }
+
+        // Emit the body of the loop
+        insertBlock(bodyLabel);
+        IRBlock* prevScopeEndBlock = pushScopeBlock(continueLabel);
+        lowerStmt(context, stmt->statement);
+        popScopeBlock(prevScopeEndBlock, true);
+
+        // At the end of the body we need to jump back to the top.
+        emitBranchIfNeeded(loopHead);
+
+        // Finally we insert the label that a `break` will jump to
+        insertBlock(breakLabel);
+    }
+
+    void visitDoWhileStmt(DoWhileStmt* stmt)
+    {
+        // Generating IR for `do {...} while` statement is similar to a
+        // `while` statement, just with the test in a different place
+
+        auto builder = getBuilder();
+        startBlockIfNeeded(stmt);
+
+        // We will create blocks for the various places
+        // we need to jump to inside the control flow,
+        // including the blocks that will be referenced
+        // by `continue` or `break` statements.
+        auto loopHead = createBlock();
+        auto testLabel = createBlock();
+        auto breakLabel = createBlock();
+
+        // A `continue` inside a `do { ... } while ( ... )` loop always
+        // jumps to the loop test.
+        auto continueLabel = testLabel;
+
+        // Register the `break` and `continue` labels so
+        // that we can find them for nested statements.
+        context->shared->breakLabels.add(stmt->uniqueID, breakLabel);
+        context->shared->continueLabels.add(stmt->uniqueID, continueLabel);
+
+        // Emit the branch that will start out loop,
+        // and then insert the block for the head.
+
+        auto loopInst = builder->emitLoop(loopHead, breakLabel, continueLabel);
+
+        addLoopDecorations(loopInst, stmt);
+
+        insertBlock(loopHead);
+
+        // Emit the body of the loop
+        IRBlock* prevScopeEndBlock = pushScopeBlock(continueLabel);
+        lowerStmt(context, stmt->statement);
+        popScopeBlock(prevScopeEndBlock, true);
+
+        insertBlock(testLabel);
+
+        // Now that we are within the header block, we
+        // want to emit the expression for the loop condition:
+        if (auto condExpr = stmt->predicate)
+        {
+            maybeEmitDebugLine(context, *this, stmt, stmt->predicate->loc);
+
+            auto irCondition = getSimpleVal(context, lowerRValueExpr(context, condExpr));
+
+            // One thing to be careful here is that lowering irCondition
+            // may create additional blocks due to short circuiting, so
+            // the block we are current inserting into is not necessarily
+            // the same as `testLabel`.
+            //
+            auto invCondition = builder->emitNot(irCondition->getDataType(), irCondition);
+
+            // Now we want to `break` if the loop condition is false,
+            // otherwise we will jump back to the head of the loop.
+            //
+            // We need to make sure not to reuse the break block of the loop as
+            // the break/merge block of the ifelse test.
+            // Therefore, we introduce a separate merge block for the loop test.
+            //
+            // Emit the following structure:
+            //
+            // [merge(mergeBlock)]
+            // if (cond) goto loopHead;
+            // else goto mergeBlock;
+            //
+            // mergeBlock:
+            //   goto breakLabel;
+            auto mergeBlock = builder->createBlock();
+            builder->emitIfElse(invCondition, breakLabel, mergeBlock, mergeBlock);
+
+            insertBlock(mergeBlock);
+            builder->emitBranch(loopHead);
+        }
+
+        // Finally we insert the label that a `break` will jump to
+        insertBlock(breakLabel);
+    }
+
+    void visitGpuForeachStmt(GpuForeachStmt* stmt)
+    {
+        auto builder = getBuilder();
+        startBlockIfNeeded(stmt);
+
+        auto device = getSimpleVal(context, lowerRValueExpr(context, stmt->device));
+        auto gridDims = getSimpleVal(context, lowerRValueExpr(context, stmt->gridDims));
+
+        List<IRInst*> irArgs;
+        if (auto callExpr = as<InvokeExpr>(stmt->kernelCall))
+        {
+            irArgs.add(device);
+            irArgs.add(gridDims);
+            auto fref = getSimpleVal(context, lowerRValueExpr(context, callExpr->functionExpr));
+            irArgs.add(fref);
+            for (auto arg : callExpr->arguments)
+            {
+                // if a reference to dispatchThreadID, don't emit
+                if (auto declRefExpr = as<DeclRefExpr>(arg))
+                {
+                    if (declRefExpr->declRef.getDecl() == stmt->dispatchThreadID)
+                    {
+                        continue;
+                    }
+                }
+                auto irArg = getSimpleVal(context, lowerRValueExpr(context, arg));
+                irArgs.add(irArg);
+            }
+        }
+        else
+        {
+            SLANG_UNEXPECTED("GPUForeach parsing produced an invalid result");
+        }
+
+        builder->emitGpuForeach(irArgs);
+        return;
+    }
+
+    void visitExpressionStmt(ExpressionStmt* stmt)
+    {
+        startBlockIfNeeded(stmt);
+
+        // The statement evaluates an expression
+        // (for side effects, one assumes) and then
+        // discards the result. As such, we simply
+        // lower the expression, and don't use
+        // the result.
+        //
+        // Note that we lower using the l-value path,
+        // so that an expression statement that names
+        // a location (but doesn't load from it)
+        // will not actually emit a load.
+        lowerLValueExpr(context, stmt->expression);
+    }
+
+    void visitDeclStmt(DeclStmt* stmt)
+    {
+        startBlockIfNeeded(stmt);
+
+        // For now, we lower a declaration directly
+        // into the current context.
+        //
+        // TODO: We may want to consider whether
+        // nested type/function declarations should
+        // be lowered into the global scope during
+        // IR generation, or whether they should
+        // be lifted later (pushing capture analysis
+        // down to the IR).
+        //
+        lowerDecl(context, stmt->decl);
+    }
+
+    void visitSeqStmt(SeqStmt* stmt)
+    {
+        // To lower a sequence of statements,
+        // just lower each in order
+        for (auto ss : stmt->stmts)
+        {
+            lowerStmt(context, ss);
+        }
+    }
+
+    void visitBlockStmt(BlockStmt* stmt)
+    {
+        IRBlock* prevScopeEndBlock = pushScopeBlock(nullptr);
+
+        // To lower a block (scope) statement, just lower its body.
+        lowerStmt(context, stmt->body);
+
+        popScopeBlock(prevScopeEndBlock, false);
+    }
+
+    void visitReturnStmt(ReturnStmt* stmt)
+    {
+        startBlockIfNeeded(stmt);
+
+        // Check if this return is within a constructor.
+        auto constructorDecl = as<ConstructorDecl>(context->funcDecl);
+
+        // A `return` statement turns into a `return` instruction,
+        // but we have two kinds of `return`: one for returning
+        // a (non-`void`) value, and one for returning "no value"
+        // (which effectively returns a value of type `void`).
+        //
+        if (auto expr = stmt->expression)
+        {
+            if (context->returnDestination.flavor != LoweredValInfo::Flavor::None)
+            {
+                // If this function should return via a __ref parameter, do that and return void.
+                lowerRValueExprWithDestination(context, context->returnDestination, expr);
+                getBuilder()->emitReturn();
+                return;
+            }
+
+            if (constructorDecl)
+            {
+                // If this function is a constructor, but returns a value, rewrite it as
+                // this = val;
+                // return this;
+                lowerRValueExprWithDestination(context, context->thisVal, expr);
+                getBuilder()->emitReturn(getSimpleVal(context, context->thisVal));
+                return;
+            }
+
+            // If the AST `return` statement had an expression, then we
+            // need to lower it to the IR at this point, both to
+            // compute its value and (in case we are returning a
+            // `void`-typed expression) to execute its side effects.
+            //
+            auto loweredExpr = lowerRValueExpr(context, expr);
+
+            // If the AST `return` statement was returning a non-`void`
+            // value, then we need to emit an IR `return` of that value.
+            //
+            if (!expr->type.type->equals(context->astBuilder->getVoidType()))
+            {
+                getBuilder()->emitReturn(getSimpleVal(context, loweredExpr));
+            }
+            else
+            {
+                // If the type of the value returned was `void`, then
+                // we don't want to emit an IR-level `return` with a value,
+                // because that could trip up some of our back-end.
+                //
+                // TODO: We should eventually have only a single IR-level
+                // `return` operation that always takes a value (including
+                // values of type `void`), and then treat an AST `return;`
+                // as equivalent to something like `return void();`.
+                //
+                getBuilder()->emitReturn();
+            }
+        }
+        else
+        {
+            // If we hit this case, then the AST `return` was a `return;`
+            // with no value, which can only occur in a function with
+            // a `void` result type.
+            //
+            if (constructorDecl)
+            {
+                // If this `return` is within a NonCopyableType or an ordinary constructor,
+                // then we must either simply return or `return` the instance respectively.
+                if (context->returnDestination.flavor != LoweredValInfo::Flavor::None)
+                {
+                    // If we have a NonCopyableType constructor of the form
+                    //   void ctor(inout this) { return; }
+                    getBuilder()->emitReturn();
+                }
+                else
+                {
+                    // If we have an ordinary constructor of the form
+                    //   Type ctor() { return; }
+                    getBuilder()->emitReturn(getSimpleVal(context, context->thisVal));
+                }
+                return;
+            }
+            getBuilder()->emitReturn();
+        }
+    }
+
+    void visitDeferStmt(DeferStmt* stmt)
+    {
+        auto builder = getBuilder();
+        startBlockIfNeeded(stmt);
+
+        IRBlock* deferBlock = builder->createBlock();
+        IRBlock* mergeBlock = builder->createBlock();
+
+        builder->emitDefer(deferBlock, mergeBlock, context->scopeEndBlock);
+
+        builder->insertBlock(deferBlock);
+        builder->setInsertInto(deferBlock);
+
+        IRBlock* prevScopeEndBlock = pushScopeBlock(mergeBlock);
+        lowerStmt(context, stmt->statement);
+        popScopeBlock(prevScopeEndBlock, true);
+
+        builder->emitBranch(mergeBlock);
+
+        builder->insertBlock(mergeBlock);
+        builder->setInsertInto(mergeBlock);
+    }
+
+    void visitThrowStmt(ThrowStmt* stmt)
+    {
+        auto builder = getBuilder();
+        startBlockIfNeeded(stmt);
+
+        auto loweredExpr = lowerRValueExpr(context, stmt->expression);
+        auto loweredVal = getSimpleVal(context, loweredExpr);
+        auto throwType = lowerType(context, stmt->expression->type);
+
+        CatchHandler handler;
+        if (loweredVal && throwType)
+        {
+            handler = findErrorHandler(context, throwType);
+        }
+
+        if (handler.errorHandler)
+        {
+            builder->emitBranch(handler.errorHandler, 1, &loweredVal);
+        }
+        else
+        {
+            builder->emitThrow(getSimpleVal(context, loweredExpr));
+        }
+    }
+
+    void visitCatchStmt(CatchStmt* stmt)
+    {
+        auto builder = getBuilder();
+        startBlockIfNeeded(stmt);
+
+        // The mental model here is that the below Catch statement:
+        //
+        // let val = try MayThrowFunc();
+        // // Do stuff with val
+        // catch(err: Error)
+        // {
+        //     catchBlock(err);
+        // }
+        //
+        // lowers similarly to:
+        //
+        // handlerLoop: for(;;)
+        // {
+        //     E err; // Actually just a parameter for the catchBlock, not a real variable.
+        //     bodyLoop: for(;;)
+        //     {
+        //         // Body goes here
+        //         Result<T, E> r = mayThrowFunc();
+        //         if(isResultError(r))
+        //         {
+        //             err = r.error;
+        //             break bodyLoop;
+        //         }
+        //         let val = r.getSuccessValue();
+        //         // Do stuff with val
+        //         break handlerLoop;
+        //     }
+        //     catchBlock(err);
+        //     break handlerLoop;
+        // }
+        //
+        // This approach allows for it to generate valid SPIR-V. Just jumping
+        // around with unstructured conditional jumps doesn't work there.
+
+        IRBlock* handlerLoopHead = createBlock();
+        IRBlock* handlerBreakLabel = createBlock();
+        IRBlock* bodyLoopHead = createBlock();
+        IRBlock* bodyBreakLabel = createBlock();
+
+        builder->emitLoop(handlerLoopHead, handlerBreakLabel, handlerLoopHead);
+        insertBlock(handlerLoopHead);
+
+        builder->emitLoop(bodyLoopHead, bodyBreakLabel, bodyLoopHead);
+        insertBlock(bodyLoopHead);
+
+        CatchHandler catchHandler;
+        catchHandler.errorType =
+            stmt->errorVar ? lowerType(context, stmt->errorVar->getType()) : nullptr;
+        catchHandler.errorHandler = bodyBreakLabel;
+        catchHandler.prev = context->catchHandler;
+        context->catchHandler = &catchHandler;
+
+        // Note that the tryBody doesn't actually have to have it's own scope or
+        // block. If there's a `defer` in the tryBody, it can run after the
+        // catch statement.
+        lowerStmt(context, stmt->tryBody);
+
+        // Put break; at the end of the body if there's nothing else there yet.
+        // This prevents the catch handler from running.
+        emitBranchIfNeeded(handlerBreakLabel);
+
+        context->catchHandler = catchHandler.prev;
+
+        insertBlock(bodyBreakLabel);
+
+        if (catchHandler.errorType)
+        {
+            auto irParam = builder->emitParam(catchHandler.errorType);
+            auto paramVal = LoweredValInfo::simple(irParam);
+            context->setGlobalValue(stmt->errorVar, paramVal);
+        }
+
+        IRBlock* prevScopeEndBlock = pushScopeBlock(handlerBreakLabel);
+        lowerStmt(context, stmt->handleBody);
+        popScopeBlock(prevScopeEndBlock, true);
+
+        emitBranchIfNeeded(handlerBreakLabel);
+
+        insertBlock(handlerBreakLabel);
+    }
+
+    void visitDiscardStmt(DiscardStmt* stmt)
+    {
+        startBlockIfNeeded(stmt);
+        getBuilder()->emitDiscard();
+    }
+
+    void visitBreakStmt(BreakStmt* stmt)
+    {
+        startBlockIfNeeded(stmt);
+
+        // Semantic checking is responsible for finding
+        // the statement taht this `break` breaks out of
+        auto targetStmtID = stmt->targetOuterStmtID;
+        SLANG_ASSERT(targetStmtID != BreakableStmt::kInvalidUniqueID);
+
+        // We just need to look up the basic block that
+        // corresponds to the break label for that statement,
+        // and then emit an instruction to jump to it.
+        IRBlock* targetBlock = nullptr;
+        context->shared->breakLabels.tryGetValue(targetStmtID, targetBlock);
+        SLANG_ASSERT(targetBlock);
+        getBuilder()->emitBreak(targetBlock);
+    }
+
+    void visitContinueStmt(ContinueStmt* stmt)
+    {
+        startBlockIfNeeded(stmt);
+
+        // Semantic checking is responsible for finding
+        // the loop that this `continue` statement continues
+        auto targetStmtID = stmt->targetOuterStmtID;
+        SLANG_ASSERT(targetStmtID != BreakableStmt::kInvalidUniqueID);
+
+
+        // We just need to look up the basic block that
+        // corresponds to the continue label for that statement,
+        // and then emit an instruction to jump to it.
+        IRBlock* targetBlock = nullptr;
+        context->shared->continueLabels.tryGetValue(targetStmtID, targetBlock);
+        SLANG_ASSERT(targetBlock);
+        getBuilder()->emitContinue(targetBlock);
+    }
+
+    // Lowering a `switch` statement can get pretty involved,
+    // so we need to track a bit of extra data:
+    struct SwitchStmtInfo
+    {
+        // The block that will be made to contain the `switch` statement
+        IRBlock* initialBlock = nullptr;
+
+        // The label for the `default` case, if any.
+        IRBlock* defaultLabel = nullptr;
+
+        // The label of the current "active" case block.
+        IRBlock* currentCaseLabel = nullptr;
+
+        // Has anything been emitted to the current "active" case block?
+        bool anythingEmittedToCurrentCaseBlock = false;
+
+        // The collected (value, label) pairs for
+        // all the `case` statements.
+        List<IRInst*> cases;
+    };
+
+    // We need a label to use for a `case` or `default` statement,
+    // so either create one here, or re-use the current one if
+    // that is okay.
+    IRBlock* getLabelForCase(SwitchStmtInfo* info)
+    {
+        // Look at the "current" label we are working with.
+        auto currentCaseLabel = info->currentCaseLabel;
+
+        // If there is a current block, and it is empty,
+        // then it is still a viable target (we are in
+        // a case of "trivial fall-through" from the previous
+        // block).
+        if (currentCaseLabel && !info->anythingEmittedToCurrentCaseBlock)
+        {
+            return currentCaseLabel;
+        }
+
+        // Othwerise, we need to start a new block and use that.
+        IRBlock* newCaseLabel = createBlock();
+
+        // Note: if the previous block failed
+        // to end with a `break`, then inserting
+        // this block will append an unconditional
+        // branch to the end of it that will target
+        // this block.
+        insertBlock(newCaseLabel);
+
+        info->currentCaseLabel = newCaseLabel;
+        info->anythingEmittedToCurrentCaseBlock = false;
+        return newCaseLabel;
+    }
+
+    bool hasSwitchCases(Stmt* inStmt)
+    {
+        Stmt* stmt = inStmt;
+        // Unwrap any surrounding `{ ... }` so we can look
+        // at the statement inside.
+        while (auto blockStmt = as<BlockStmt>(stmt))
+        {
+            stmt = blockStmt->body;
+            continue;
+        }
+
+        if (auto seqStmt = as<SeqStmt>(stmt))
+        {
+            // Walk through the children looking for cases
+            for (auto childStmt : seqStmt->stmts)
+            {
+                if (hasSwitchCases(childStmt))
+                {
+                    return true;
+                }
+            }
+        }
+        else if (const auto caseStmt = as<CaseStmt>(stmt))
+        {
+            return true;
+        }
+        else if (const auto defaultStmt = as<DefaultStmt>(stmt))
+        {
+            // A 'default:' is a kind of case.
+            return true;
+        }
+
+        return false;
+    }
+
+    // Given a statement that appears as (or in) the body
+    // of a `switch` statement
+    void lowerSwitchCases(Stmt* inStmt, SwitchStmtInfo* info)
+    {
+        // TODO: in the general case (e.g., if we were going
+        // to eventual lower to an unstructured format like LLVM),
+        // the Right Way to handle C-style `switch` statements
+        // is just to emit the body directly as "normal" statements,
+        // and then treat `case` and `default` as special statements
+        // that start a new block and register a label with the
+        // enclosing `switch`.
+        //
+        // For now we will assume that any `case` and `default`
+        // statements need to be directly nested under the `switch`,
+        // and so we can find them with a simpler walk.
+
+        Stmt* stmt = inStmt;
+
+        // Unwrap any surrounding `{ ... }` so we can look
+        // at the statement inside.
+        while (auto blockStmt = as<BlockStmt>(stmt))
+        {
+            stmt = blockStmt->body;
+            continue;
+        }
+
+        if (auto seqStmt = as<SeqStmt>(stmt))
+        {
+            // Walk through teh children and process each.
+            for (auto childStmt : seqStmt->stmts)
+            {
+                lowerSwitchCases(childStmt, info);
+            }
+        }
+        else if (auto caseStmt = as<CaseStmt>(stmt))
+        {
+            // A full `case` statement has a value we need
+            // to test against. It is expected to be a
+            // compile-time constant, so we will emit
+            // it like an expression here, and then hope
+            // for the best.
+            //
+            // TODO: figure out something cleaner.
+
+            // Actually, one gotcha is that if we ever allow non-constant
+            // expressions here (or anything that requires instructions
+            // to be emitted to yield its value), then those instructions
+            // need to go into an appropriate block.
+
+            IRGenContext subContext = *context;
+            IRBuilder subBuilder = *getBuilder();
+            subBuilder.setInsertInto(info->initialBlock);
+            subContext.irBuilder = &subBuilder;
+
+            auto constVal = as<ConstantIntVal>(caseStmt->exprVal);
+            SLANG_ASSERT(constVal);
+            auto caseType = lowerType(context, constVal->getType());
+            auto caseValInfo =
+                LoweredValInfo::simple(getBuilder()->getIntValue(caseType, constVal->getValue()));
+            auto caseVal = getSimpleVal(context, caseValInfo);
+
+            // Figure out where we are branching to.
+            auto label = getLabelForCase(info);
+
+            // Add this `case` to the list for the enclosing `switch`.
+            info->cases.add(caseVal);
+            info->cases.add(label);
+        }
+        else if (const auto defaultStmt = as<DefaultStmt>(stmt))
+        {
+            auto label = getLabelForCase(info);
+
+            // We expect to only find a single `default` stmt.
+            SLANG_ASSERT(!info->defaultLabel);
+
+            info->defaultLabel = label;
+        }
+        else if (const auto emptyStmt = as<EmptyStmt>(stmt))
+        {
+            // Special-case empty statements so they don't
+            // mess up our "trivial fall-through" optimization.
+        }
+        else
+        {
+            // We have an ordinary statement, that needs to get
+            // emitted to the current case block.
+            if (!info->currentCaseLabel)
+            {
+                // It possible in full C/C++ to have statements
+                // before the first `case`. Usually these are
+                // unreachable, unless they start with a label.
+                //
+                // We'll ignore them here, figuring they are
+                // dead. If we ever add `LabelStmt` then we'd
+                // need to emit these statements to a dummy
+                // block just in case.
+            }
+            else
+            {
+                // Emit the code to our current case block,
+                // and record that we've done so.
+                lowerStmt(context, stmt);
+                info->anythingEmittedToCurrentCaseBlock = true;
+            }
+        }
+    }
+
+    void visitStageSwitchStmt(StageSwitchStmt* stmt)
+    {
+        if (!stmt->targetCases.getCount())
+            return;
+
+        // We will lower stage switch as a normal switch statement, so they can participate in all
+        // optimizations.
+        auto builder = getBuilder();
+        startBlockIfNeeded(stmt);
+
+        // First emit code to get the current stage to switch on:
+        auto conditionVal = builder->emitGetCurrentStage();
+
+        // Remember the initial block so that we can add to it
+        // after we've collected all the `case`s
+        auto initialBlock = builder->getBlock();
+
+        // Next, create a block to use as the target for any `break` statements
+        auto breakLabel = createBlock();
+
+        // Register the `break` label so
+        // that we can find it for nested statements.
+        context->shared->breakLabels.add(stmt->uniqueID, breakLabel);
+
+        builder->setInsertInto(initialBlock->getParent());
+
+        // Iterate over the body of the statement, looking
+        // for `case` or `default` statements:
+        SwitchStmtInfo info;
+        info.initialBlock = initialBlock;
+        info.defaultLabel = nullptr;
+
+        Dictionary<Stmt*, IRBlock*> mapCaseStmtToBlock;
+        for (auto targetCase : stmt->targetCases)
+        {
+            IRBlock* caseBlock = nullptr;
+            if (!mapCaseStmtToBlock.tryGetValue(targetCase->body, caseBlock))
+            {
+                caseBlock = builder->emitBlock();
+                lowerStmt(context, targetCase->body);
+                mapCaseStmtToBlock.add(targetCase->body, caseBlock);
+                if (!builder->getBlock()->getTerminator())
+                    builder->emitBranch(breakLabel);
+            }
+            if (targetCase->capability == 0)
+            {
+                info.defaultLabel = caseBlock;
+            }
+            else
+            {
+                auto stage = getStageFromAtom((CapabilityAtom)targetCase->capability);
+                info.cases.add(builder->getIntValue(builder->getIntType(), (IRIntegerValue)stage));
+                info.cases.add(caseBlock);
+            }
+        }
+
+        // If the current block (the end of the last
+        // `case`) is not terminated, then terminate with a
+        // `break` operation.
+        //
+        // Double check that we aren't in the initial
+        // block, so we don't get tripped up on an
+        // empty `switch`.
+        auto curBlock = builder->getBlock();
+        if (curBlock != initialBlock)
+        {
+            // Is the block already terminated?
+            if (!curBlock->getTerminator())
+            {
+                // Not terminated, so add one.
+                builder->emitBreak(breakLabel);
+            }
+        }
+
+        // If there was no `default` statement, then the
+        // default case will just branch directly to the end.
+        auto defaultLabel = info.defaultLabel ? info.defaultLabel : breakLabel;
+
+        // Now that we've collected the cases, we are
+        // prepared to emit the `switch` instruction
+        // itself.
+        builder->setInsertInto(initialBlock);
+        builder->emitSwitch(
+            conditionVal,
+            breakLabel,
+            defaultLabel,
+            info.cases.getCount(),
+            info.cases.getBuffer());
+
+        // Finally we insert the label that a `break` will jump to
+        // (and that control flow will fall through to otherwise).
+        // This is the block that subsequent code will go into.
+        insertBlock(breakLabel);
+        context->shared->breakLabels.remove(stmt->uniqueID);
+    }
+
+    void visitTargetSwitchStmt(TargetSwitchStmt* stmt)
+    {
+        if (!stmt->targetCases.getCount())
+            return;
+
+        auto builder = getBuilder();
+        startBlockIfNeeded(stmt);
+        auto initialBlock = builder->getBlock();
+        auto breakLabel = builder->createBlock();
+        context->shared->breakLabels.add(stmt->uniqueID, breakLabel);
+        builder->setInsertInto(initialBlock->getParent());
+        List<IRInst*> args;
+        args.add(breakLabel);
+        Dictionary<Stmt*, IRBlock*> mapCaseStmtToBlock;
+        for (auto targetCase : stmt->targetCases)
+        {
+            IRBlock* caseBlock = nullptr;
+            if (!mapCaseStmtToBlock.tryGetValue(targetCase->body, caseBlock))
+            {
+                caseBlock = builder->emitBlock();
+                lowerStmt(context, targetCase->body);
+                mapCaseStmtToBlock.add(targetCase->body, caseBlock);
+                if (!builder->getBlock()->getTerminator())
+                    builder->emitBranch(breakLabel);
+            }
+            args.add(builder->getIntValue(builder->getIntType(), targetCase->capability));
+            args.add(caseBlock);
+        }
+        context->shared->breakLabels.remove(stmt->uniqueID);
+        builder->setInsertInto(initialBlock);
+
+        auto parentFunc = initialBlock->getParent();
+        parentFunc->addBlock(breakLabel);
+
+        builder->emitIntrinsicInst(
+            nullptr,
+            kIROp_TargetSwitch,
+            (UInt)args.getCount(),
+            args.getBuffer());
+
+        builder->setInsertInto(breakLabel);
+    }
+
+    void visitTargetCaseStmt(TargetCaseStmt*) { SLANG_UNREACHABLE("lowering target case"); }
+
+    void visitIntrinsicAsmStmt(IntrinsicAsmStmt* stmt)
+    {
+        auto builder = getBuilder();
+        ShortList<IRInst*> args;
+        args.add(builder->getStringValue(stmt->asmText.getUnownedSlice()));
+        for (auto argExpr : stmt->args)
+        {
+            if (auto typetype = as<TypeType>(argExpr->type))
+            {
+                auto type = lowerType(context, typetype->getType());
+                args.add(type);
+            }
+            else
+            {
+                auto argVal = lowerRValueExpr(context, argExpr);
+                args.add(argVal.val);
+            }
+        }
+        builder->emitIntrinsicInst(
+            nullptr,
+            kIROp_GenericAsm,
+            args.getCount(),
+            args.getArrayView().getBuffer());
+    }
+
+    void visitSwitchStmt(SwitchStmt* stmt)
+    {
+        auto builder = getBuilder();
+        startBlockIfNeeded(stmt);
+
+        // Given a statement:
+        //
+        //      switch( CONDITION )
+        //      {
+        //      case V0:
+        //          S0;
+        //          break;
+        //
+        //      case V1:
+        //      default:
+        //          S1;
+        //          break;
+        //      }
+        //
+        // we want to generate IR like:
+        //
+        //      let %c = <CONDITION>;
+        //      switch %c,          // value to switch on
+        //          %breakLabel,    // join point (and break target)
+        //          %s1,            // default label
+        //          %v0,            // first case value
+        //          %s0,            // first case label
+        //          %v1,            // second case value
+        //          %s1             // second case label
+        //  s0:
+        //      <S0>
+        //      break %breakLabel
+        //  s1:
+        //      <S1>
+        //      break %breakLabel
+        //  breakLabel:
+        //
+
+        // First emit code to compute the condition:
+        auto conditionVal = getSimpleVal(context, lowerRValueExpr(context, stmt->condition));
+
+        // Check for any cases or default.
+        if (!hasSwitchCases(stmt->body))
+        {
+            // If we don't have any case/default then nothing inside switch can be executed (other
+            // than condition) so we are done.
+            return;
+        }
+
+        // Remember the initial block so that we can add to it
+        // after we've collected all the `case`s
+        auto initialBlock = builder->getBlock();
+
+        // Next, create a block to use as the target for any `break` statements
+        auto breakLabel = createBlock();
+
+        // Register the `break` label so
+        // that we can find it for nested statements.
+        context->shared->breakLabels.add(stmt->uniqueID, breakLabel);
+
+        builder->setInsertInto(initialBlock->getParent());
+
+        // Iterate over the body of the statement, looking
+        // for `case` or `default` statements:
+        SwitchStmtInfo info;
+        info.initialBlock = initialBlock;
+        info.defaultLabel = nullptr;
+        lowerSwitchCases(stmt->body, &info);
+
+        // TODO: once we've discovered the cases, we should
+        // be able to make a quick pass over the list and eliminate
+        // any cases that have the exact same label as the `default`
+        // case, since these don't actually need to be represented.
+
+        // If the current block (the end of the last
+        // `case`) is not terminated, then terminate with a
+        // `break` operation.
+        //
+        // Double check that we aren't in the initial
+        // block, so we don't get tripped up on an
+        // empty `switch`.
+        auto curBlock = builder->getBlock();
+        if (curBlock != initialBlock)
+        {
+            // Is the block already terminated?
+            if (!curBlock->getTerminator())
+            {
+                // Not terminated, so add one.
+                builder->emitBreak(breakLabel);
+            }
+        }
+
+        // If there was no `default` statement, then the
+        // default case will just branch directly to the end.
+        auto defaultLabel = info.defaultLabel ? info.defaultLabel : breakLabel;
+
+        // Now that we've collected the cases, we are
+        // prepared to emit the `switch` instruction
+        // itself.
+        builder->setInsertInto(initialBlock);
+        auto switchInst = builder->emitSwitch(
+            conditionVal,
+            breakLabel,
+            defaultLabel,
+            info.cases.getCount(),
+            info.cases.getBuffer());
+
+        // Finally we insert the label that a `break` will jump to
+        // (and that control flow will fall through to otherwise).
+        // This is the block that subsequent code will go into.
+        insertBlock(breakLabel);
+        context->shared->breakLabels.remove(stmt->uniqueID);
+
+        // If there is the branch attribute output the IR decoration
+        if (stmt->hasModifier<BranchAttribute>())
+        {
+            builder->addDecoration(switchInst, kIROp_BranchDecoration);
+        }
+    }
+};
+
 template<typename Derived>
 struct ExprLoweringVisitorBase : public ExprVisitor<Derived, LoweredValInfo>
 {
@@ -6007,1380 +7381,6 @@ void lowerRValueExprWithDestination(IRGenContext* context, LoweredValInfo destin
     visitor.destination = destination;
     visitor.dispatch(expr);
 }
-
-struct StmtLoweringVisitor : StmtVisitor<StmtLoweringVisitor>
-{
-    IRGenContext* context;
-
-    IRBuilder* getBuilder() { return context->irBuilder; }
-
-    void visitEmptyStmt(EmptyStmt*)
-    {
-        // Nothing to do.
-    }
-
-    void visitUnparsedStmt(UnparsedStmt*) { SLANG_UNEXPECTED("UnparsedStmt not supported by IR"); }
-
-    void visitCaseStmtBase(CaseStmtBase*)
-    {
-        SLANG_UNEXPECTED("`case` or `default` not under `switch`");
-    }
-
-    void visitLabelStmt(LabelStmt* stmt) { lowerStmt(context, stmt->innerStmt); }
-
-    void visitCompileTimeForStmt(CompileTimeForStmt* stmt)
-    {
-        // The user is asking us to emit code for the loop
-        // body for each value in the given integer range.
-        // For now, we will handle this by repeatedly lowering
-        // the body statement, with the loop variable bound
-        // to a different integer literal value each time.
-        //
-        // TODO: eventually we might handle this as just an
-        // ordinary loop, with an `[unroll]` attribute on
-        // it that we would respect.
-
-        auto rangeBeginVal = getIntVal(stmt->rangeBeginVal);
-        auto rangeEndVal = getIntVal(stmt->rangeEndVal);
-
-        if (rangeBeginVal >= rangeEndVal)
-            return;
-
-        auto varDecl = stmt->varDecl;
-        auto varType = lowerType(context, varDecl->type);
-
-        IRGenEnv subEnvStorage;
-        IRGenEnv* subEnv = &subEnvStorage;
-        subEnv->outer = context->env;
-
-        IRGenContext subContextStorage = *context;
-        IRGenContext* subContext = &subContextStorage;
-        subContext->env = subEnv;
-
-
-        for (IntegerLiteralValue ii = rangeBeginVal; ii < rangeEndVal; ++ii)
-        {
-            auto constVal = getBuilder()->getIntValue(varType, ii);
-
-            subEnv->mapDeclToValue[varDecl] = LoweredValInfo::simple(constVal);
-
-            lowerStmt(subContext, stmt->body);
-        }
-    }
-
-    // Create a basic block in the current function,
-    // so that it can be used for a label.
-    IRBlock* createBlock() { return getBuilder()->createBlock(); }
-
-    /// Does the given block have a terminator?
-    bool isBlockTerminated(IRBlock* block) { return block->getTerminator() != nullptr; }
-
-    /// Emit a branch to the target block if the current
-    /// block being inserted into is not already terminated.
-    void emitBranchIfNeeded(IRBlock* targetBlock)
-    {
-        auto builder = getBuilder();
-        auto currentBlock = builder->getBlock();
-
-        // Don't emit if there is no current block.
-        if (!currentBlock)
-            return;
-
-        // Don't emit if the block already has a terminator.
-        if (isBlockTerminated(currentBlock))
-            return;
-
-        // The block is unterminated, so cap it off with
-        // a terminator that branches to the target.
-        builder->emitBranch(targetBlock);
-    }
-
-    /// Insert a block at the current location (ending
-    /// the previous block with an unconditional jump
-    /// if needed).
-    void insertBlock(IRBlock* block)
-    {
-        auto builder = getBuilder();
-
-        auto prevBlock = builder->getBlock();
-        auto parentFunc = prevBlock ? prevBlock->getParent() : builder->getFunc();
-
-        // If the previous block doesn't already have
-        // a terminator instruction, then be sure to
-        // emit a branch to the new block.
-        emitBranchIfNeeded(block);
-
-        // Add the new block to the function we are building,
-        // and setit as the block we will be inserting into.
-        parentFunc->addBlock(block);
-        builder->setInsertInto(block);
-    }
-
-    // Start a new block at the current location.
-    // This is just the composition of `createBlock`
-    // and `insertBlock`.
-    IRBlock* startBlock()
-    {
-        auto block = createBlock();
-        insertBlock(block);
-        return block;
-    }
-
-    /// Start a new block if there isn't a current
-    /// block that we can append to.
-    ///
-    /// The `stmt` parameter is the statement we
-    /// are about to emit.
-    void startBlockIfNeeded(Stmt* stmt)
-    {
-        auto builder = getBuilder();
-        auto currentBlock = builder->getBlock();
-
-        // If there is a current block and it hasn't
-        // been terminated, then we can just use that.
-        if (currentBlock && !isBlockTerminated(currentBlock))
-        {
-            return;
-        }
-
-        // We are about to emit code *after* a terminator
-        // instruction, and there is no label to allow
-        // branching into this code, so whatever we are
-        // about to emit is going to be unreachable.
-        //
-        // Let's diagnose that here just to help the user.
-        //
-        // TODO: We might want to have a more robust check
-        // for unreachable code based on IR analysis instead,
-        // at which point we'd probably disable this check.
-        //
-        context->getSink()->diagnose(stmt, Diagnostics::unreachableCode);
-
-        startBlock();
-    }
-
-    /// Create a new scope end block and return the previous one.
-    ///
-    /// This is needed for `defer` to be aware of scopes. `preallocated` can
-    /// be specified if you already have a block at the end of the scope, like
-    /// in `for` loops.
-    IRBlock* pushScopeBlock(IRBlock* preallocated = nullptr)
-    {
-        IRBlock* prevScopeEndBlock = context->scopeEndBlock;
-
-        auto builder = getBuilder();
-        context->scopeEndBlock = preallocated ? preallocated : builder->createBlock();
-        return prevScopeEndBlock;
-    }
-
-    /// Pop the current scope end block and restore the previous one.
-    ///
-    /// This is needed for `defer` to be aware of scopes. `previous` should be
-    /// the block returned from the corresponding pushScopeBlock. `preallocated`
-    /// should be true if the corresponding pushScopeBlock was given a block
-    /// as a parameter.
-    void popScopeBlock(IRBlock* previous, bool preallocated)
-    {
-        if (!preallocated)
-        {
-            // If pushScopeBlock actually created the block, we have to insert
-            // or deallocate it here. Otherwise, we assume that the caller
-            // handles the end block.
-            auto builder = getBuilder();
-            if (context->scopeEndBlock->hasUses())
-            {
-                // The end of the scope was referenced, so we need to actually
-                // keep it around and jump through it.
-                // Move the terminator to the scope end block.
-                emitBranchIfNeeded(context->scopeEndBlock);
-                builder->insertBlock(context->scopeEndBlock);
-                builder->setInsertInto(context->scopeEndBlock);
-            }
-            else
-            {
-                // Scope end block was left unused, so we may as well delete it.
-                context->scopeEndBlock->removeAndDeallocate();
-            }
-        }
-
-        context->scopeEndBlock = previous;
-    }
-
-    void visitIfStmt(IfStmt* stmt)
-    {
-        auto builder = getBuilder();
-        startBlockIfNeeded(stmt);
-
-        auto condExpr = stmt->predicate;
-        auto thenStmt = stmt->positiveStatement;
-        auto elseStmt = stmt->negativeStatement;
-
-        auto irCond = getSimpleVal(context, lowerRValueExpr(context, condExpr));
-
-        maybeEmitDebugLine(context, *this, stmt, condExpr->loc);
-
-        IRInst* ifInst = nullptr;
-
-        if (elseStmt)
-        {
-            auto thenBlock = createBlock();
-            auto elseBlock = createBlock();
-            auto afterBlock = createBlock();
-
-            ifInst = builder->emitIfElse(irCond, thenBlock, elseBlock, afterBlock);
-
-            insertBlock(thenBlock);
-            IRBlock* prevScopeEndBlock = pushScopeBlock(afterBlock);
-            lowerStmt(context, thenStmt);
-            emitBranchIfNeeded(afterBlock);
-
-            insertBlock(elseBlock);
-            lowerStmt(context, elseStmt);
-            popScopeBlock(prevScopeEndBlock, true);
-
-            insertBlock(afterBlock);
-        }
-        else
-        {
-            auto thenBlock = createBlock();
-            auto afterBlock = createBlock();
-
-            ifInst = builder->emitIf(irCond, thenBlock, afterBlock);
-
-            insertBlock(thenBlock);
-
-            IRBlock* prevScopeEndBlock = pushScopeBlock(afterBlock);
-            lowerStmt(context, thenStmt);
-            popScopeBlock(prevScopeEndBlock, true);
-
-            insertBlock(afterBlock);
-        }
-
-        if (stmt->findModifier<FlattenAttribute>())
-        {
-            builder->addDecoration(ifInst, kIROp_FlattenDecoration);
-        }
-        if (stmt->findModifier<BranchAttribute>())
-        {
-            builder->addDecoration(ifInst, kIROp_BranchDecoration);
-        }
-    }
-
-    void addLoopDecorations(IRInst* inst, Stmt* stmt)
-    {
-        if (stmt->findModifier<UnrollAttribute>())
-        {
-            getBuilder()->addLoopControlDecoration(inst, kIRLoopControl_Unroll);
-        }
-        else if (stmt->findModifier<LoopAttribute>())
-        {
-            getBuilder()->addLoopControlDecoration(inst, kIRLoopControl_Loop);
-        }
-
-        if (auto maxItersAttr = stmt->findModifier<MaxItersAttribute>())
-        {
-            auto iters = lowerVal(context, maxItersAttr->value);
-            getBuilder()->addLoopMaxItersDecoration(inst, getSimpleVal(context, iters));
-        }
-        else if (auto inferredMaxItersAttr = stmt->findModifier<InferredMaxItersAttribute>())
-        {
-            getBuilder()->addLoopMaxItersDecoration(inst, inferredMaxItersAttr->value);
-        }
-
-        if (auto forceUnrollAttr = stmt->findModifier<ForceUnrollAttribute>())
-        {
-            getBuilder()->addLoopForceUnrollDecoration(inst, forceUnrollAttr->maxIterations);
-        }
-        // TODO: handle other cases here
-    }
-
-    void visitForStmt(ForStmt* stmt)
-    {
-        auto builder = getBuilder();
-        startBlockIfNeeded(stmt);
-
-        // The initializer clause for the statement
-        // can always safetly be emitted to the current block.
-        if (auto initStmt = stmt->initialStatement)
-        {
-            lowerStmt(context, initStmt);
-        }
-
-        // We will create blocks for the various places
-        // we need to jump to inside the control flow,
-        // including the blocks that will be referenced
-        // by `continue` or `break` statements.
-        auto loopHead = createBlock();
-        auto bodyLabel = createBlock();
-        auto breakLabel = createBlock();
-        auto continueLabel = createBlock();
-
-        // Register the `break` and `continue` labels so
-        // that we can find them for nested statements.
-        context->shared->breakLabels.add(stmt->uniqueID, breakLabel);
-        context->shared->continueLabels.add(stmt->uniqueID, continueLabel);
-
-        // Emit the branch that will start out loop,
-        // and then insert the block for the head.
-
-        auto loopInst = builder->emitLoop(loopHead, breakLabel, continueLabel);
-
-        insertBlock(loopHead);
-
-        // Now that we are within the header block, we
-        // want to emit the expression for the loop condition:
-        if (const auto condExpr = stmt->predicateExpression)
-        {
-            maybeEmitDebugLine(context, *this, stmt, condExpr->loc);
-
-            auto irCondition =
-                getSimpleVal(context, lowerRValueExpr(context, stmt->predicateExpression));
-
-            // Now we want to `break` if the loop condition is false.
-            builder->emitLoopTest(irCondition, bodyLabel, breakLabel);
-        }
-
-        // Emit the body of the loop
-        insertBlock(bodyLabel);
-        IRBlock* prevScopeEndBlock = pushScopeBlock(continueLabel);
-        lowerStmt(context, stmt->statement);
-        popScopeBlock(prevScopeEndBlock, true);
-
-        if (auto inferredMaxIters = stmt->findModifier<InferredMaxItersAttribute>())
-        {
-            // We only use inferred max iters attribute when the loop body
-            // does not modify induction var.
-            auto inductionVar =
-                emitDeclRef(context, inferredMaxIters->inductionVar, builder->getIntType());
-            if (inductionVar.val)
-            {
-                int writes = 0;
-                traverseUsers(
-                    inductionVar.val,
-                    [&](IRInst* user)
-                    {
-                        if (user->getOp() != kIROp_Load)
-                            writes++;
-                    });
-                if (writes > 1)
-                {
-                    removeModifier(stmt, inferredMaxIters);
-                }
-            }
-        }
-        if (auto inferredMaxIters = stmt->findModifier<InferredMaxItersAttribute>())
-        {
-            if (auto maxIters = stmt->findModifier<MaxItersAttribute>())
-            {
-                if (auto constIntVal = as<ConstantIntVal>(maxIters->value))
-                {
-                    if (inferredMaxIters->value < constIntVal->getValue())
-                    {
-                        context->getSink()->diagnose(
-                            maxIters,
-                            Diagnostics::forLoopTerminatesInFewerIterationsThanMaxIters,
-                            inferredMaxIters->value);
-                    }
-                }
-            }
-        }
-        addLoopDecorations(loopInst, stmt);
-
-
-        // Insert the `continue` block
-        insertBlock(continueLabel);
-        if (auto incrExpr = stmt->sideEffectExpression)
-        {
-            maybeEmitDebugLine(context, *this, stmt, incrExpr->loc);
-            lowerRValueExpr(context, incrExpr);
-        }
-
-        // At the end of the body we need to jump back to the top.
-        emitBranchIfNeeded(loopHead);
-
-        // Finally we insert the label that a `break` will jump to
-        insertBlock(breakLabel);
-    }
-
-    void visitWhileStmt(WhileStmt* stmt)
-    {
-        // Generating IR for `while` statement is similar to a
-        // `for` statement, but without a lot of the complications.
-
-        auto builder = getBuilder();
-        startBlockIfNeeded(stmt);
-
-        // We will create blocks for the various places
-        // we need to jump to inside the control flow,
-        // including the blocks that will be referenced
-        // by `continue` or `break` statements.
-        auto loopHead = createBlock();
-        auto bodyLabel = createBlock();
-        auto breakLabel = createBlock();
-
-        // A `continue` inside a `while` loop always
-        // jumps to the head of hte loop.
-        auto continueLabel = loopHead;
-
-        // Register the `break` and `continue` labels so
-        // that we can find them for nested statements.
-        context->shared->breakLabels.add(stmt->uniqueID, breakLabel);
-        context->shared->continueLabels.add(stmt->uniqueID, continueLabel);
-
-        // Emit the branch that will start out loop,
-        // and then insert the block for the head.
-
-        auto loopInst = builder->emitLoop(loopHead, breakLabel, continueLabel);
-
-        addLoopDecorations(loopInst, stmt);
-
-        insertBlock(loopHead);
-
-        // Now that we are within the header block, we
-        // want to emit the expression for the loop condition:
-        if (auto condExpr = stmt->predicate)
-        {
-            maybeEmitDebugLine(context, *this, stmt, condExpr->loc);
-
-            auto irCondition = getSimpleVal(context, lowerRValueExpr(context, condExpr));
-
-            // Now we want to `break` if the loop condition is false.
-            builder->emitLoopTest(irCondition, bodyLabel, breakLabel);
-        }
-
-        // Emit the body of the loop
-        insertBlock(bodyLabel);
-        IRBlock* prevScopeEndBlock = pushScopeBlock(continueLabel);
-        lowerStmt(context, stmt->statement);
-        popScopeBlock(prevScopeEndBlock, true);
-
-        // At the end of the body we need to jump back to the top.
-        emitBranchIfNeeded(loopHead);
-
-        // Finally we insert the label that a `break` will jump to
-        insertBlock(breakLabel);
-    }
-
-    void visitDoWhileStmt(DoWhileStmt* stmt)
-    {
-        // Generating IR for `do {...} while` statement is similar to a
-        // `while` statement, just with the test in a different place
-
-        auto builder = getBuilder();
-        startBlockIfNeeded(stmt);
-
-        // We will create blocks for the various places
-        // we need to jump to inside the control flow,
-        // including the blocks that will be referenced
-        // by `continue` or `break` statements.
-        auto loopHead = createBlock();
-        auto testLabel = createBlock();
-        auto breakLabel = createBlock();
-
-        // A `continue` inside a `do { ... } while ( ... )` loop always
-        // jumps to the loop test.
-        auto continueLabel = testLabel;
-
-        // Register the `break` and `continue` labels so
-        // that we can find them for nested statements.
-        context->shared->breakLabels.add(stmt->uniqueID, breakLabel);
-        context->shared->continueLabels.add(stmt->uniqueID, continueLabel);
-
-        // Emit the branch that will start out loop,
-        // and then insert the block for the head.
-
-        auto loopInst = builder->emitLoop(loopHead, breakLabel, continueLabel);
-
-        addLoopDecorations(loopInst, stmt);
-
-        insertBlock(loopHead);
-
-        // Emit the body of the loop
-        IRBlock* prevScopeEndBlock = pushScopeBlock(continueLabel);
-        lowerStmt(context, stmt->statement);
-        popScopeBlock(prevScopeEndBlock, true);
-
-        insertBlock(testLabel);
-
-        // Now that we are within the header block, we
-        // want to emit the expression for the loop condition:
-        if (auto condExpr = stmt->predicate)
-        {
-            maybeEmitDebugLine(context, *this, stmt, stmt->predicate->loc);
-
-            auto irCondition = getSimpleVal(context, lowerRValueExpr(context, condExpr));
-
-            // One thing to be careful here is that lowering irCondition
-            // may create additional blocks due to short circuiting, so
-            // the block we are current inserting into is not necessarily
-            // the same as `testLabel`.
-            //
-            auto invCondition = builder->emitNot(irCondition->getDataType(), irCondition);
-
-            // Now we want to `break` if the loop condition is false,
-            // otherwise we will jump back to the head of the loop.
-            //
-            // We need to make sure not to reuse the break block of the loop as
-            // the break/merge block of the ifelse test.
-            // Therefore, we introduce a separate merge block for the loop test.
-            //
-            // Emit the following structure:
-            //
-            // [merge(mergeBlock)]
-            // if (cond) goto loopHead;
-            // else goto mergeBlock;
-            //
-            // mergeBlock:
-            //   goto breakLabel;
-            auto mergeBlock = builder->createBlock();
-            builder->emitIfElse(invCondition, breakLabel, mergeBlock, mergeBlock);
-
-            insertBlock(mergeBlock);
-            builder->emitBranch(loopHead);
-        }
-
-        // Finally we insert the label that a `break` will jump to
-        insertBlock(breakLabel);
-    }
-
-    void visitGpuForeachStmt(GpuForeachStmt* stmt)
-    {
-        auto builder = getBuilder();
-        startBlockIfNeeded(stmt);
-
-        auto device = getSimpleVal(context, lowerRValueExpr(context, stmt->device));
-        auto gridDims = getSimpleVal(context, lowerRValueExpr(context, stmt->gridDims));
-
-        List<IRInst*> irArgs;
-        if (auto callExpr = as<InvokeExpr>(stmt->kernelCall))
-        {
-            irArgs.add(device);
-            irArgs.add(gridDims);
-            auto fref = getSimpleVal(context, lowerRValueExpr(context, callExpr->functionExpr));
-            irArgs.add(fref);
-            for (auto arg : callExpr->arguments)
-            {
-                // if a reference to dispatchThreadID, don't emit
-                if (auto declRefExpr = as<DeclRefExpr>(arg))
-                {
-                    if (declRefExpr->declRef.getDecl() == stmt->dispatchThreadID)
-                    {
-                        continue;
-                    }
-                }
-                auto irArg = getSimpleVal(context, lowerRValueExpr(context, arg));
-                irArgs.add(irArg);
-            }
-        }
-        else
-        {
-            SLANG_UNEXPECTED("GPUForeach parsing produced an invalid result");
-        }
-
-        builder->emitGpuForeach(irArgs);
-        return;
-    }
-
-    void visitExpressionStmt(ExpressionStmt* stmt)
-    {
-        startBlockIfNeeded(stmt);
-
-        // The statement evaluates an expression
-        // (for side effects, one assumes) and then
-        // discards the result. As such, we simply
-        // lower the expression, and don't use
-        // the result.
-        //
-        // Note that we lower using the l-value path,
-        // so that an expression statement that names
-        // a location (but doesn't load from it)
-        // will not actually emit a load.
-        lowerLValueExpr(context, stmt->expression);
-    }
-
-    void visitDeclStmt(DeclStmt* stmt)
-    {
-        startBlockIfNeeded(stmt);
-
-        // For now, we lower a declaration directly
-        // into the current context.
-        //
-        // TODO: We may want to consider whether
-        // nested type/function declarations should
-        // be lowered into the global scope during
-        // IR generation, or whether they should
-        // be lifted later (pushing capture analysis
-        // down to the IR).
-        //
-        lowerDecl(context, stmt->decl);
-    }
-
-    void visitSeqStmt(SeqStmt* stmt)
-    {
-        // To lower a sequence of statements,
-        // just lower each in order
-        for (auto ss : stmt->stmts)
-        {
-            lowerStmt(context, ss);
-        }
-    }
-
-    void visitBlockStmt(BlockStmt* stmt)
-    {
-        IRBlock* prevScopeEndBlock = pushScopeBlock(nullptr);
-
-        // To lower a block (scope) statement, just lower its body.
-        lowerStmt(context, stmt->body);
-
-        popScopeBlock(prevScopeEndBlock, false);
-    }
-
-    void visitReturnStmt(ReturnStmt* stmt)
-    {
-        startBlockIfNeeded(stmt);
-
-        // Check if this return is within a constructor.
-        auto constructorDecl = as<ConstructorDecl>(context->funcDecl);
-
-        // A `return` statement turns into a `return` instruction,
-        // but we have two kinds of `return`: one for returning
-        // a (non-`void`) value, and one for returning "no value"
-        // (which effectively returns a value of type `void`).
-        //
-        if (auto expr = stmt->expression)
-        {
-            if (context->returnDestination.flavor != LoweredValInfo::Flavor::None)
-            {
-                // If this function should return via a __ref parameter, do that and return void.
-                lowerRValueExprWithDestination(context, context->returnDestination, expr);
-                getBuilder()->emitReturn();
-                return;
-            }
-
-            if (constructorDecl)
-            {
-                // If this function is a constructor, but returns a value, rewrite it as
-                // this = val;
-                // return this;
-                lowerRValueExprWithDestination(context, context->thisVal, expr);
-                getBuilder()->emitReturn(getSimpleVal(context, context->thisVal));
-                return;
-            }
-
-            // If the AST `return` statement had an expression, then we
-            // need to lower it to the IR at this point, both to
-            // compute its value and (in case we are returning a
-            // `void`-typed expression) to execute its side effects.
-            //
-            auto loweredExpr = lowerRValueExpr(context, expr);
-
-            // If the AST `return` statement was returning a non-`void`
-            // value, then we need to emit an IR `return` of that value.
-            //
-            if (!expr->type.type->equals(context->astBuilder->getVoidType()))
-            {
-                getBuilder()->emitReturn(getSimpleVal(context, loweredExpr));
-            }
-            else
-            {
-                // If the type of the value returned was `void`, then
-                // we don't want to emit an IR-level `return` with a value,
-                // because that could trip up some of our back-end.
-                //
-                // TODO: We should eventually have only a single IR-level
-                // `return` operation that always takes a value (including
-                // values of type `void`), and then treat an AST `return;`
-                // as equivalent to something like `return void();`.
-                //
-                getBuilder()->emitReturn();
-            }
-        }
-        else
-        {
-            // If we hit this case, then the AST `return` was a `return;`
-            // with no value, which can only occur in a function with
-            // a `void` result type.
-            //
-            if (constructorDecl)
-            {
-                // If this `return` is within a NonCopyableType or an ordinary constructor,
-                // then we must either simply return or `return` the instance respectively.
-                if (context->returnDestination.flavor != LoweredValInfo::Flavor::None)
-                {
-                    // If we have a NonCopyableType constructor of the form
-                    //   void ctor(inout this) { return; }
-                    getBuilder()->emitReturn();
-                }
-                else
-                {
-                    // If we have an ordinary constructor of the form
-                    //   Type ctor() { return; }
-                    getBuilder()->emitReturn(getSimpleVal(context, context->thisVal));
-                }
-                return;
-            }
-            getBuilder()->emitReturn();
-        }
-    }
-
-    void visitDeferStmt(DeferStmt* stmt)
-    {
-        auto builder = getBuilder();
-        startBlockIfNeeded(stmt);
-
-        IRBlock* deferBlock = builder->createBlock();
-        IRBlock* mergeBlock = builder->createBlock();
-
-        builder->emitDefer(deferBlock, mergeBlock, context->scopeEndBlock);
-
-        builder->insertBlock(deferBlock);
-        builder->setInsertInto(deferBlock);
-
-        IRBlock* prevScopeEndBlock = pushScopeBlock(mergeBlock);
-        lowerStmt(context, stmt->statement);
-        popScopeBlock(prevScopeEndBlock, true);
-
-        builder->emitBranch(mergeBlock);
-
-        builder->insertBlock(mergeBlock);
-        builder->setInsertInto(mergeBlock);
-    }
-
-    void visitThrowStmt(ThrowStmt* stmt)
-    {
-        auto builder = getBuilder();
-        startBlockIfNeeded(stmt);
-
-        auto loweredExpr = lowerRValueExpr(context, stmt->expression);
-        auto loweredVal = getSimpleVal(context, loweredExpr);
-        auto throwType = lowerType(context, stmt->expression->type);
-
-        CatchHandler handler;
-        if (loweredVal && throwType)
-        {
-            handler = findErrorHandler(context, throwType);
-        }
-
-        if (handler.errorHandler)
-        {
-            builder->emitBranch(handler.errorHandler, 1, &loweredVal);
-        }
-        else
-        {
-            builder->emitThrow(getSimpleVal(context, loweredExpr));
-        }
-    }
-
-    void visitCatchStmt(CatchStmt* stmt)
-    {
-        auto builder = getBuilder();
-        startBlockIfNeeded(stmt);
-
-        // The mental model here is that the below Catch statement:
-        //
-        // let val = try MayThrowFunc();
-        // // Do stuff with val
-        // catch(err: Error)
-        // {
-        //     catchBlock(err);
-        // }
-        //
-        // lowers similarly to:
-        //
-        // handlerLoop: for(;;)
-        // {
-        //     E err; // Actually just a parameter for the catchBlock, not a real variable.
-        //     bodyLoop: for(;;)
-        //     {
-        //         // Body goes here
-        //         Result<T, E> r = mayThrowFunc();
-        //         if(isResultError(r))
-        //         {
-        //             err = r.error;
-        //             break bodyLoop;
-        //         }
-        //         let val = r.getSuccessValue();
-        //         // Do stuff with val
-        //         break handlerLoop;
-        //     }
-        //     catchBlock(err);
-        //     break handlerLoop;
-        // }
-        //
-        // This approach allows for it to generate valid SPIR-V. Just jumping
-        // around with unstructured conditional jumps doesn't work there.
-
-        IRBlock* handlerLoopHead = createBlock();
-        IRBlock* handlerBreakLabel = createBlock();
-        IRBlock* bodyLoopHead = createBlock();
-        IRBlock* bodyBreakLabel = createBlock();
-
-        builder->emitLoop(handlerLoopHead, handlerBreakLabel, handlerLoopHead);
-        insertBlock(handlerLoopHead);
-
-        builder->emitLoop(bodyLoopHead, bodyBreakLabel, bodyLoopHead);
-        insertBlock(bodyLoopHead);
-
-        CatchHandler catchHandler;
-        catchHandler.errorType =
-            stmt->errorVar ? lowerType(context, stmt->errorVar->getType()) : nullptr;
-        catchHandler.errorHandler = bodyBreakLabel;
-        catchHandler.prev = context->catchHandler;
-        context->catchHandler = &catchHandler;
-
-        // Note that the tryBody doesn't actually have to have it's own scope or
-        // block. If there's a `defer` in the tryBody, it can run after the
-        // catch statement.
-        lowerStmt(context, stmt->tryBody);
-
-        // Put break; at the end of the body if there's nothing else there yet.
-        // This prevents the catch handler from running.
-        emitBranchIfNeeded(handlerBreakLabel);
-
-        context->catchHandler = catchHandler.prev;
-
-        insertBlock(bodyBreakLabel);
-
-        if (catchHandler.errorType)
-        {
-            auto irParam = builder->emitParam(catchHandler.errorType);
-            auto paramVal = LoweredValInfo::simple(irParam);
-            context->setGlobalValue(stmt->errorVar, paramVal);
-        }
-
-        IRBlock* prevScopeEndBlock = pushScopeBlock(handlerBreakLabel);
-        lowerStmt(context, stmt->handleBody);
-        popScopeBlock(prevScopeEndBlock, true);
-
-        emitBranchIfNeeded(handlerBreakLabel);
-
-        insertBlock(handlerBreakLabel);
-    }
-
-    void visitDiscardStmt(DiscardStmt* stmt)
-    {
-        startBlockIfNeeded(stmt);
-        getBuilder()->emitDiscard();
-    }
-
-    void visitBreakStmt(BreakStmt* stmt)
-    {
-        startBlockIfNeeded(stmt);
-
-        // Semantic checking is responsible for finding
-        // the statement taht this `break` breaks out of
-        auto targetStmtID = stmt->targetOuterStmtID;
-        SLANG_ASSERT(targetStmtID != BreakableStmt::kInvalidUniqueID);
-
-        // We just need to look up the basic block that
-        // corresponds to the break label for that statement,
-        // and then emit an instruction to jump to it.
-        IRBlock* targetBlock = nullptr;
-        context->shared->breakLabels.tryGetValue(targetStmtID, targetBlock);
-        SLANG_ASSERT(targetBlock);
-        getBuilder()->emitBreak(targetBlock);
-    }
-
-    void visitContinueStmt(ContinueStmt* stmt)
-    {
-        startBlockIfNeeded(stmt);
-
-        // Semantic checking is responsible for finding
-        // the loop that this `continue` statement continues
-        auto targetStmtID = stmt->targetOuterStmtID;
-        SLANG_ASSERT(targetStmtID != BreakableStmt::kInvalidUniqueID);
-
-
-        // We just need to look up the basic block that
-        // corresponds to the continue label for that statement,
-        // and then emit an instruction to jump to it.
-        IRBlock* targetBlock = nullptr;
-        context->shared->continueLabels.tryGetValue(targetStmtID, targetBlock);
-        SLANG_ASSERT(targetBlock);
-        getBuilder()->emitContinue(targetBlock);
-    }
-
-    // Lowering a `switch` statement can get pretty involved,
-    // so we need to track a bit of extra data:
-    struct SwitchStmtInfo
-    {
-        // The block that will be made to contain the `switch` statement
-        IRBlock* initialBlock = nullptr;
-
-        // The label for the `default` case, if any.
-        IRBlock* defaultLabel = nullptr;
-
-        // The label of the current "active" case block.
-        IRBlock* currentCaseLabel = nullptr;
-
-        // Has anything been emitted to the current "active" case block?
-        bool anythingEmittedToCurrentCaseBlock = false;
-
-        // The collected (value, label) pairs for
-        // all the `case` statements.
-        List<IRInst*> cases;
-    };
-
-    // We need a label to use for a `case` or `default` statement,
-    // so either create one here, or re-use the current one if
-    // that is okay.
-    IRBlock* getLabelForCase(SwitchStmtInfo* info)
-    {
-        // Look at the "current" label we are working with.
-        auto currentCaseLabel = info->currentCaseLabel;
-
-        // If there is a current block, and it is empty,
-        // then it is still a viable target (we are in
-        // a case of "trivial fall-through" from the previous
-        // block).
-        if (currentCaseLabel && !info->anythingEmittedToCurrentCaseBlock)
-        {
-            return currentCaseLabel;
-        }
-
-        // Othwerise, we need to start a new block and use that.
-        IRBlock* newCaseLabel = createBlock();
-
-        // Note: if the previous block failed
-        // to end with a `break`, then inserting
-        // this block will append an unconditional
-        // branch to the end of it that will target
-        // this block.
-        insertBlock(newCaseLabel);
-
-        info->currentCaseLabel = newCaseLabel;
-        info->anythingEmittedToCurrentCaseBlock = false;
-        return newCaseLabel;
-    }
-
-    bool hasSwitchCases(Stmt* inStmt)
-    {
-        Stmt* stmt = inStmt;
-        // Unwrap any surrounding `{ ... }` so we can look
-        // at the statement inside.
-        while (auto blockStmt = as<BlockStmt>(stmt))
-        {
-            stmt = blockStmt->body;
-            continue;
-        }
-
-        if (auto seqStmt = as<SeqStmt>(stmt))
-        {
-            // Walk through the children looking for cases
-            for (auto childStmt : seqStmt->stmts)
-            {
-                if (hasSwitchCases(childStmt))
-                {
-                    return true;
-                }
-            }
-        }
-        else if (const auto caseStmt = as<CaseStmt>(stmt))
-        {
-            return true;
-        }
-        else if (const auto defaultStmt = as<DefaultStmt>(stmt))
-        {
-            // A 'default:' is a kind of case.
-            return true;
-        }
-
-        return false;
-    }
-
-    // Given a statement that appears as (or in) the body
-    // of a `switch` statement
-    void lowerSwitchCases(Stmt* inStmt, SwitchStmtInfo* info)
-    {
-        // TODO: in the general case (e.g., if we were going
-        // to eventual lower to an unstructured format like LLVM),
-        // the Right Way to handle C-style `switch` statements
-        // is just to emit the body directly as "normal" statements,
-        // and then treat `case` and `default` as special statements
-        // that start a new block and register a label with the
-        // enclosing `switch`.
-        //
-        // For now we will assume that any `case` and `default`
-        // statements need to be directly nested under the `switch`,
-        // and so we can find them with a simpler walk.
-
-        Stmt* stmt = inStmt;
-
-        // Unwrap any surrounding `{ ... }` so we can look
-        // at the statement inside.
-        while (auto blockStmt = as<BlockStmt>(stmt))
-        {
-            stmt = blockStmt->body;
-            continue;
-        }
-
-        if (auto seqStmt = as<SeqStmt>(stmt))
-        {
-            // Walk through teh children and process each.
-            for (auto childStmt : seqStmt->stmts)
-            {
-                lowerSwitchCases(childStmt, info);
-            }
-        }
-        else if (auto caseStmt = as<CaseStmt>(stmt))
-        {
-            // A full `case` statement has a value we need
-            // to test against. It is expected to be a
-            // compile-time constant, so we will emit
-            // it like an expression here, and then hope
-            // for the best.
-            //
-            // TODO: figure out something cleaner.
-
-            // Actually, one gotcha is that if we ever allow non-constant
-            // expressions here (or anything that requires instructions
-            // to be emitted to yield its value), then those instructions
-            // need to go into an appropriate block.
-
-            IRGenContext subContext = *context;
-            IRBuilder subBuilder = *getBuilder();
-            subBuilder.setInsertInto(info->initialBlock);
-            subContext.irBuilder = &subBuilder;
-
-            auto constVal = as<ConstantIntVal>(caseStmt->exprVal);
-            SLANG_ASSERT(constVal);
-            auto caseType = lowerType(context, constVal->getType());
-            auto caseValInfo =
-                LoweredValInfo::simple(getBuilder()->getIntValue(caseType, constVal->getValue()));
-            auto caseVal = getSimpleVal(context, caseValInfo);
-
-            // Figure out where we are branching to.
-            auto label = getLabelForCase(info);
-
-            // Add this `case` to the list for the enclosing `switch`.
-            info->cases.add(caseVal);
-            info->cases.add(label);
-        }
-        else if (const auto defaultStmt = as<DefaultStmt>(stmt))
-        {
-            auto label = getLabelForCase(info);
-
-            // We expect to only find a single `default` stmt.
-            SLANG_ASSERT(!info->defaultLabel);
-
-            info->defaultLabel = label;
-        }
-        else if (const auto emptyStmt = as<EmptyStmt>(stmt))
-        {
-            // Special-case empty statements so they don't
-            // mess up our "trivial fall-through" optimization.
-        }
-        else
-        {
-            // We have an ordinary statement, that needs to get
-            // emitted to the current case block.
-            if (!info->currentCaseLabel)
-            {
-                // It possible in full C/C++ to have statements
-                // before the first `case`. Usually these are
-                // unreachable, unless they start with a label.
-                //
-                // We'll ignore them here, figuring they are
-                // dead. If we ever add `LabelStmt` then we'd
-                // need to emit these statements to a dummy
-                // block just in case.
-            }
-            else
-            {
-                // Emit the code to our current case block,
-                // and record that we've done so.
-                lowerStmt(context, stmt);
-                info->anythingEmittedToCurrentCaseBlock = true;
-            }
-        }
-    }
-
-    void visitStageSwitchStmt(StageSwitchStmt* stmt)
-    {
-        if (!stmt->targetCases.getCount())
-            return;
-
-        // We will lower stage switch as a normal switch statement, so they can participate in all
-        // optimizations.
-        auto builder = getBuilder();
-        startBlockIfNeeded(stmt);
-
-        // First emit code to get the current stage to switch on:
-        auto conditionVal = builder->emitGetCurrentStage();
-
-        // Remember the initial block so that we can add to it
-        // after we've collected all the `case`s
-        auto initialBlock = builder->getBlock();
-
-        // Next, create a block to use as the target for any `break` statements
-        auto breakLabel = createBlock();
-
-        // Register the `break` label so
-        // that we can find it for nested statements.
-        context->shared->breakLabels.add(stmt->uniqueID, breakLabel);
-
-        builder->setInsertInto(initialBlock->getParent());
-
-        // Iterate over the body of the statement, looking
-        // for `case` or `default` statements:
-        SwitchStmtInfo info;
-        info.initialBlock = initialBlock;
-        info.defaultLabel = nullptr;
-
-        Dictionary<Stmt*, IRBlock*> mapCaseStmtToBlock;
-        for (auto targetCase : stmt->targetCases)
-        {
-            IRBlock* caseBlock = nullptr;
-            if (!mapCaseStmtToBlock.tryGetValue(targetCase->body, caseBlock))
-            {
-                caseBlock = builder->emitBlock();
-                lowerStmt(context, targetCase->body);
-                mapCaseStmtToBlock.add(targetCase->body, caseBlock);
-                if (!builder->getBlock()->getTerminator())
-                    builder->emitBranch(breakLabel);
-            }
-            if (targetCase->capability == 0)
-            {
-                info.defaultLabel = caseBlock;
-            }
-            else
-            {
-                auto stage = getStageFromAtom((CapabilityAtom)targetCase->capability);
-                info.cases.add(builder->getIntValue(builder->getIntType(), (IRIntegerValue)stage));
-                info.cases.add(caseBlock);
-            }
-        }
-
-        // If the current block (the end of the last
-        // `case`) is not terminated, then terminate with a
-        // `break` operation.
-        //
-        // Double check that we aren't in the initial
-        // block, so we don't get tripped up on an
-        // empty `switch`.
-        auto curBlock = builder->getBlock();
-        if (curBlock != initialBlock)
-        {
-            // Is the block already terminated?
-            if (!curBlock->getTerminator())
-            {
-                // Not terminated, so add one.
-                builder->emitBreak(breakLabel);
-            }
-        }
-
-        // If there was no `default` statement, then the
-        // default case will just branch directly to the end.
-        auto defaultLabel = info.defaultLabel ? info.defaultLabel : breakLabel;
-
-        // Now that we've collected the cases, we are
-        // prepared to emit the `switch` instruction
-        // itself.
-        builder->setInsertInto(initialBlock);
-        builder->emitSwitch(
-            conditionVal,
-            breakLabel,
-            defaultLabel,
-            info.cases.getCount(),
-            info.cases.getBuffer());
-
-        // Finally we insert the label that a `break` will jump to
-        // (and that control flow will fall through to otherwise).
-        // This is the block that subsequent code will go into.
-        insertBlock(breakLabel);
-        context->shared->breakLabels.remove(stmt->uniqueID);
-    }
-
-    void visitTargetSwitchStmt(TargetSwitchStmt* stmt)
-    {
-        if (!stmt->targetCases.getCount())
-            return;
-
-        auto builder = getBuilder();
-        startBlockIfNeeded(stmt);
-        auto initialBlock = builder->getBlock();
-        auto breakLabel = builder->createBlock();
-        context->shared->breakLabels.add(stmt->uniqueID, breakLabel);
-        builder->setInsertInto(initialBlock->getParent());
-        List<IRInst*> args;
-        args.add(breakLabel);
-        Dictionary<Stmt*, IRBlock*> mapCaseStmtToBlock;
-        for (auto targetCase : stmt->targetCases)
-        {
-            IRBlock* caseBlock = nullptr;
-            if (!mapCaseStmtToBlock.tryGetValue(targetCase->body, caseBlock))
-            {
-                caseBlock = builder->emitBlock();
-                lowerStmt(context, targetCase->body);
-                mapCaseStmtToBlock.add(targetCase->body, caseBlock);
-                if (!builder->getBlock()->getTerminator())
-                    builder->emitBranch(breakLabel);
-            }
-            args.add(builder->getIntValue(builder->getIntType(), targetCase->capability));
-            args.add(caseBlock);
-        }
-        context->shared->breakLabels.remove(stmt->uniqueID);
-        builder->setInsertInto(initialBlock);
-
-        auto parentFunc = initialBlock->getParent();
-        parentFunc->addBlock(breakLabel);
-
-        builder->emitIntrinsicInst(
-            nullptr,
-            kIROp_TargetSwitch,
-            (UInt)args.getCount(),
-            args.getBuffer());
-
-        builder->setInsertInto(breakLabel);
-    }
-
-    void visitTargetCaseStmt(TargetCaseStmt*) { SLANG_UNREACHABLE("lowering target case"); }
-
-    void visitIntrinsicAsmStmt(IntrinsicAsmStmt* stmt)
-    {
-        auto builder = getBuilder();
-        ShortList<IRInst*> args;
-        args.add(builder->getStringValue(stmt->asmText.getUnownedSlice()));
-        for (auto argExpr : stmt->args)
-        {
-            if (auto typetype = as<TypeType>(argExpr->type))
-            {
-                auto type = lowerType(context, typetype->getType());
-                args.add(type);
-            }
-            else
-            {
-                auto argVal = lowerRValueExpr(context, argExpr);
-                args.add(argVal.val);
-            }
-        }
-        builder->emitIntrinsicInst(
-            nullptr,
-            kIROp_GenericAsm,
-            args.getCount(),
-            args.getArrayView().getBuffer());
-    }
-
-    void visitSwitchStmt(SwitchStmt* stmt)
-    {
-        auto builder = getBuilder();
-        startBlockIfNeeded(stmt);
-
-        // Given a statement:
-        //
-        //      switch( CONDITION )
-        //      {
-        //      case V0:
-        //          S0;
-        //          break;
-        //
-        //      case V1:
-        //      default:
-        //          S1;
-        //          break;
-        //      }
-        //
-        // we want to generate IR like:
-        //
-        //      let %c = <CONDITION>;
-        //      switch %c,          // value to switch on
-        //          %breakLabel,    // join point (and break target)
-        //          %s1,            // default label
-        //          %v0,            // first case value
-        //          %s0,            // first case label
-        //          %v1,            // second case value
-        //          %s1             // second case label
-        //  s0:
-        //      <S0>
-        //      break %breakLabel
-        //  s1:
-        //      <S1>
-        //      break %breakLabel
-        //  breakLabel:
-        //
-
-        // First emit code to compute the condition:
-        auto conditionVal = getSimpleVal(context, lowerRValueExpr(context, stmt->condition));
-
-        // Check for any cases or default.
-        if (!hasSwitchCases(stmt->body))
-        {
-            // If we don't have any case/default then nothing inside switch can be executed (other
-            // than condition) so we are done.
-            return;
-        }
-
-        // Remember the initial block so that we can add to it
-        // after we've collected all the `case`s
-        auto initialBlock = builder->getBlock();
-
-        // Next, create a block to use as the target for any `break` statements
-        auto breakLabel = createBlock();
-
-        // Register the `break` label so
-        // that we can find it for nested statements.
-        context->shared->breakLabels.add(stmt->uniqueID, breakLabel);
-
-        builder->setInsertInto(initialBlock->getParent());
-
-        // Iterate over the body of the statement, looking
-        // for `case` or `default` statements:
-        SwitchStmtInfo info;
-        info.initialBlock = initialBlock;
-        info.defaultLabel = nullptr;
-        lowerSwitchCases(stmt->body, &info);
-
-        // TODO: once we've discovered the cases, we should
-        // be able to make a quick pass over the list and eliminate
-        // any cases that have the exact same label as the `default`
-        // case, since these don't actually need to be represented.
-
-        // If the current block (the end of the last
-        // `case`) is not terminated, then terminate with a
-        // `break` operation.
-        //
-        // Double check that we aren't in the initial
-        // block, so we don't get tripped up on an
-        // empty `switch`.
-        auto curBlock = builder->getBlock();
-        if (curBlock != initialBlock)
-        {
-            // Is the block already terminated?
-            if (!curBlock->getTerminator())
-            {
-                // Not terminated, so add one.
-                builder->emitBreak(breakLabel);
-            }
-        }
-
-        // If there was no `default` statement, then the
-        // default case will just branch directly to the end.
-        auto defaultLabel = info.defaultLabel ? info.defaultLabel : breakLabel;
-
-        // Now that we've collected the cases, we are
-        // prepared to emit the `switch` instruction
-        // itself.
-        builder->setInsertInto(initialBlock);
-        auto switchInst = builder->emitSwitch(
-            conditionVal,
-            breakLabel,
-            defaultLabel,
-            info.cases.getCount(),
-            info.cases.getBuffer());
-
-        // Finally we insert the label that a `break` will jump to
-        // (and that control flow will fall through to otherwise).
-        // This is the block that subsequent code will go into.
-        insertBlock(breakLabel);
-        context->shared->breakLabels.remove(stmt->uniqueID);
-
-        // If there is the branch attribute output the IR decoration
-        if (stmt->hasModifier<BranchAttribute>())
-        {
-            builder->addDecoration(switchInst, kIROp_BranchDecoration);
-        }
-    }
-};
 
 IRInst* getOrEmitDebugSource(IRGenContext* context, PathInfo path)
 {
