@@ -7414,7 +7414,8 @@ void maybeEmitDebugLine(
     if (!context->includeDebugInfo)
         return;
 
-    if (!allowNullStmt) {
+    if (!allowNullStmt)
+    {
         if (as<EmptyStmt>(stmt))
             return;
         if (!loc.isValid())
@@ -7427,8 +7428,7 @@ void maybeEmitDebugLine(
         return;
 
     IRInst* debugSourceInst = nullptr;
-    auto humaneLoc =
-        sourceManager->getHumaneLoc(loc, SourceLocType::Emit);
+    auto humaneLoc = sourceManager->getHumaneLoc(loc, SourceLocType::Emit);
 
     // Do a best-effort attempt to retrieve the nominal source file.
     auto pathInfo = sourceView->getPathInfo(loc, SourceLocType::Emit);
