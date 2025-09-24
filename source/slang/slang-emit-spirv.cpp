@@ -1506,14 +1506,15 @@ struct SPIRVEmitContext : public SourceEmitterBase, public SPIRVEmitSharedContex
         if (targetCaps.implies(CapabilityAtom::spvBindlessTextureNV))
         {
             requireSPIRVCapability((SpvCapability)SpvCapabilityBindlessTextureNV);
-            requireSPIRVCapability(SpvCapabilityInt64);  // Required for 64-bit addressing mode
+            requireSPIRVCapability(SpvCapabilityInt64); // Required for 64-bit addressing mode
             ensureExtensionDeclaration(UnownedStringSlice("SPV_NV_bindless_texture"));
 
             emitInstCustomOperandFunc(
                 getSection(SpvLogicalSectionID::MemoryModel),
                 nullptr,
                 SpvOpSamplerImageAddressingModeNV,
-                [&]() {
+                [&]()
+                {
                     emitOperand(SpvWord(64)); // 64-bit addressing mode
                 });
         }
@@ -2150,13 +2151,20 @@ struct SPIRVEmitContext : public SourceEmitterBase, public SPIRVEmitSharedContex
 
                 if (targetCaps.implies(CapabilityAtom::spvBindlessTextureNV))
                 {
-                    // For spvBindlessTextureNV, DescriptorHandleType should be a uint64_t (OpTypeInt 64 0)
-                    return emitOpTypeInt(inst, SpvLiteralInteger::from32(64), SpvLiteralInteger::from32(0));
+                    // For spvBindlessTextureNV, DescriptorHandleType should be a uint64_t
+                    // (OpTypeInt 64 0)
+                    return emitOpTypeInt(
+                        inst,
+                        SpvLiteralInteger::from32(64),
+                        SpvLiteralInteger::from32(0));
                 }
                 else
                 {
                     // For other targets, use uint2 (OpTypeVector of 2 uint32)
-                    return emitOpTypeVector(inst, builder.getUIntType(), SpvLiteralInteger::from32(2));
+                    return emitOpTypeVector(
+                        inst,
+                        builder.getUIntType(),
+                        SpvLiteralInteger::from32(2));
                 }
             }
         case kIROp_SubpassInputType:
@@ -4208,13 +4216,26 @@ struct SPIRVEmitContext : public SourceEmitterBase, public SPIRVEmitSharedContex
                     {
                     case kIROp_TextureType:
                         conversionOp = SpvOpConvertUToSampledImageNV;
-                        result = emitInst(parent, inst, conversionOp, inst->getDataType(), kResultID, operand);
+                        result = emitInst(
+                            parent,
+                            inst,
+                            conversionOp,
+                            inst->getDataType(),
+                            kResultID,
+                            operand);
                     case kIROp_SamplerStateType:
                         conversionOp = SpvOpConvertUToSamplerNV;
-                        result = emitInst(parent, inst, conversionOp, inst->getDataType(), kResultID, operand);
+                        result = emitInst(
+                            parent,
+                            inst,
+                            conversionOp,
+                            inst->getDataType(),
+                            kResultID,
+                            operand);
                     default:
                         // Unsupported result type for descriptor-to-resource conversion
-                        SLANG_UNEXPECTED("Unsupported result type for CastDescriptorHandleToResource");
+                        SLANG_UNEXPECTED(
+                            "Unsupported result type for CastDescriptorHandleToResource");
                         break;
                     }
                 }
