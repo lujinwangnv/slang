@@ -9876,7 +9876,7 @@ SlangResult emitSPIRVFromIR(
         {
             context.setDefaultDebugSource(as<IRDebugSource>(loc->getSource()));
             context.ensureInst(loc->getSource());
-            break;  // Use first entry point's source as the main file
+            break; // Use first entry point's source as the main file
         }
     }
     // Create DebugCompilationUnit after all debug sources are processed,
