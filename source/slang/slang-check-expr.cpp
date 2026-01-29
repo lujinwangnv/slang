@@ -2106,11 +2106,23 @@ IntVal* SemanticsVisitor::tryConstantFoldExpr(
         }
         else if (opName == getName("!"))
         {
-            resultValue = constArgVals[0] != 0;
+            resultValue = constArgVals[0] == 0;
         }
         else if (opName == getName("~"))
         {
             resultValue = ~constArgVals[0];
+        }
+        else if (opName == getName("&&"))
+        {
+            if (argCount != 2)
+                return nullptr;
+            resultValue = (constArgVals[0] != 0) && (constArgVals[1] != 0);
+        }
+        else if (opName == getName("||"))
+        {
+            if (argCount != 2)
+                return nullptr;
+            resultValue = (constArgVals[0] != 0) || (constArgVals[1] != 0);
         }
 
         // simple binary operators
@@ -2241,7 +2253,20 @@ IntVal* SemanticsVisitor::tryConstantFoldDeclRef(
         // Extern const is not considered compile-time constant by the front-end.
         if (kind == ConstantFoldingKind::CompileTime)
             return nullptr;
-        // But if we are OK with link-time constants, we can still fold it into a val.
+
+        // If the extern const has an initializer, try to fold it to get a concrete value.
+        // This allows expressions using extern const values (e.g., `!flag` or `flag && condition`)
+        // to be fully evaluated at compile time when the extern const has a known initializer.
+        if (auto initExpr = getInitExpr(m_astBuilder, declRef))
+        {
+            ensureDecl(declRef.getDecl(), DeclCheckState::DefinitionChecked);
+            ConstantFoldingCircularityInfo newCircularityInfo(decl, circularityInfo);
+            if (auto val = tryConstantFoldExpr(initExpr, kind, &newCircularityInfo))
+                return val;
+        }
+
+        // If we couldn't fold the initializer (or there is none), fall back to a symbolic
+        // reference that will be resolved at link time.
         auto rs = m_astBuilder->getOrCreate<DeclRefIntVal>(
             declRef.substitute(m_astBuilder, declRef.getDecl()->getType()),
             declRef);
